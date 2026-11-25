@@ -32,6 +32,51 @@ const MAX_WS_PAYLOAD = 1024 * 1024;  // 1 MiB — tool results are small JSON
 // population without this cap.
 const MAX_WS_CONNECTIONS = 500;
 
+// Retained relay state is bounded independently of WebSocket message size.
+// A normal bot registers nine small tools and makes one call at a time; these
+// ceilings leave ample event headroom without allowing public-key holders to
+// turn registration or timeout caches into unbounded storage.
+export const RELAY_LIMITS = Object.freeze({
+  registrations: 200,
+  toolsPerRegistration: 32,
+  toolBytesPerRegistration: 64 * 1024,
+  pendingCalls: 500,
+  pendingCallsPerBot: 4,
+  keyChars: 128,
+  participantChars: 64,
+});
+
+const RELAY_KEY_RE = /^[A-Za-z0-9_-]+$/;
+
+function isBoundedString(value, maxChars, maxBytes = maxChars * 4) {
+  return typeof value === 'string'
+    && value.length > 0
+    && [...value].length <= maxChars
+    && Buffer.byteLength(value, 'utf8') <= maxBytes;
+}
+
+function serializedBytes(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  } catch {
+    return Infinity;
+  }
+}
+
+function toolsAreValid(tools) {
+  if (!Array.isArray(tools) || tools.length > RELAY_LIMITS.toolsPerRegistration) return false;
+  if (serializedBytes(tools) > RELAY_LIMITS.toolBytesPerRegistration) return false;
+  return tools.every((tool) => tool !== null
+    && typeof tool === 'object'
+    && !Array.isArray(tool)
+    && isBoundedString(tool.name, 64)
+    && (tool.description === undefined
+      || (typeof tool.description === 'string' && Buffer.byteLength(tool.description, 'utf8') <= 4_096))
+    && tool.inputSchema !== null
+    && typeof tool.inputSchema === 'object'
+    && !Array.isArray(tool.inputSchema));
+}
+
 function keysEqual(a, b) {
   const ba = Buffer.from(String(a ?? ''));
   const bb = Buffer.from(String(b ?? ''));
@@ -53,7 +98,7 @@ export class Relay {
     // the bots map with junk. Empty = open (local dev).
     this.workshopKey = workshopKey;
     this.bots = new Map();     // key -> {ws, participant, tools, connectedAt, lastSeen, calls}
-    this.pending = new Map();  // callId -> {resolve, timer, key}
+    this.pending = new Map();  // callId -> {resolve, timer, key, ws}
     this._nextCallId = 1;
   }
 
@@ -134,6 +179,7 @@ export class Relay {
   }
 
   _onMessage(ws, msg) {
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
     if (msg.type === 'register') {
       const { participant, key, tools } = msg;
       if (this.workshopKey && !keysEqual(msg.workshop_key, this.workshopKey)) {
@@ -144,22 +190,50 @@ export class Relay {
         ws.close();
         return;
       }
-      if (!key || typeof key !== 'string' || key.length < 8) {
-        ws.send(JSON.stringify({ type: 'error', error: 'register requires a key (>=8 chars)' }));
+      // A socket has exactly one immutable registration. Without this check,
+      // one connection can leave arbitrarily many key -> socket entries whose
+      // close handler can only discover the last key.
+      if (ws._relayKey) {
+        ws.send(JSON.stringify({ type: 'error', error: 'socket is already registered' }));
+        ws.close(1008, 'duplicate registration');
+        return;
+      }
+      if (!isBoundedString(key, RELAY_LIMITS.keyChars, RELAY_LIMITS.keyChars)
+          || key.length < 8
+          || !RELAY_KEY_RE.test(key)) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: 'register requires an 8-128 character key using letters, digits, _ or -',
+        }));
+        ws.close();
+        return;
+      }
+      if (!isBoundedString(participant, RELAY_LIMITS.participantChars, 256)) {
+        ws.send(JSON.stringify({ type: 'error', error: 'participant must be a string of at most 64 characters' }));
+        ws.close();
+        return;
+      }
+      if (!toolsAreValid(tools)) {
+        ws.send(JSON.stringify({ type: 'error', error: 'tool list is invalid or exceeds relay limits' }));
         ws.close();
         return;
       }
       // One bot per key: a re-registration (bot restart, network blip,
       // second machine) supersedes the old connection.
       const existing = this.bots.get(key);
-      if (existing && existing.ws !== ws && existing.ws.readyState === existing.ws.OPEN) {
+      if (!existing && this.bots.size >= RELAY_LIMITS.registrations) {
+        ws.send(JSON.stringify({ type: 'error', error: 'relay registration limit reached' }));
+        ws.close(1013, 'registration limit reached');
+        return;
+      }
+      if (existing?.ws && existing.ws !== ws && existing.ws.readyState === existing.ws.OPEN) {
         existing.ws.close(4000, 'superseded by new registration');
       }
       ws._relayKey = key;
       this.bots.set(key, {
         ws,
-        participant: String(participant || 'unknown').slice(0, 64),
-        tools: Array.isArray(tools) ? tools : [],
+        participant,
+        tools,
         connectedAt: existing?.ws === ws ? existing.connectedAt : Date.now(),
         lastSeen: Date.now(),
         calls: existing?.calls || 0,
@@ -170,7 +244,7 @@ export class Relay {
     }
     if (msg.type === 'result') {
       const pending = this.pending.get(msg.id);
-      if (!pending) return; // late result after timeout — drop
+      if (!pending || pending.ws !== ws) return; // late or wrong-socket result — drop
       this.pending.delete(msg.id);
       clearTimeout(pending.timer);
       const bot = ws._relayKey && this.bots.get(ws._relayKey);
@@ -201,7 +275,7 @@ export class Relay {
     // Fail any in-flight calls for this key — better an immediate error
     // (the agent retries) than a 150s hang.
     for (const [id, p] of this.pending) {
-      if (p.key === key) {
+      if (p.ws === ws) {
         this.pending.delete(id);
         clearTimeout(p.timer);
         p.resolve({ ok: false, error: 'bot disconnected mid-call — it should reconnect within seconds; retry' });
@@ -239,6 +313,16 @@ export class Relay {
           + 'check that the bot is running (./setup.sh) and can reach the event server.',
       });
     }
+    if (this.pending.size >= RELAY_LIMITS.pendingCalls) {
+      return Promise.resolve({ ok: false, error: 'relay is at its global in-flight call limit; retry shortly' });
+    }
+    let callsForBot = 0;
+    for (const pending of this.pending.values()) {
+      if (pending.key === key) callsForBot++;
+    }
+    if (callsForBot >= RELAY_LIMITS.pendingCallsPerBot) {
+      return Promise.resolve({ ok: false, error: 'bot is at its in-flight call limit; retry shortly' });
+    }
     const id = `c${this._nextCallId++}`;
     bot.calls++;
     bot.lastCallAt = Date.now();
@@ -247,7 +331,7 @@ export class Relay {
         this.pending.delete(id);
         resolve({ ok: false, error: `tool call timed out after ${Math.round(timeoutMs / 1000)}s` });
       }, timeoutMs);
-      this.pending.set(id, { resolve, timer, key });
+      this.pending.set(id, { resolve, timer, key, ws: bot.ws });
       bot.ws.send(JSON.stringify({ type: 'call', id, name, args }), (err) => {
         if (err) {
           this.pending.delete(id);

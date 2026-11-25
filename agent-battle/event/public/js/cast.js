@@ -225,10 +225,9 @@ const Cast = {
     const ago = ageS < 60 ? `${ageS}s`
       : ageS < 3600 ? `${Math.floor(ageS / 60)}m`
       : `${Math.floor(ageS / 3600)}h`;
-    const nRuns = p.runs_count || (p.runs ? Object.keys(p.runs).length : 0);
+    const nRuns = p.runs_count || 0;
     // "This run" = most recently updated run's live diamond counter.
-    const latest = Object.values(p.runs || {})
-      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))[0];
+    const latest = p.latest_run;
     const thisRun = (live && latest)
       ? `<span style="opacity:.85">&#x1F48E; ${latest.diamonds ?? 0}</span>`
       : '<span style="opacity:.3">&mdash;</span>';
