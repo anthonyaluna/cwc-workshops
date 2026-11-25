@@ -11,7 +11,8 @@
 //   - ranking = best-run diamonds DESC, that run's tokens ASC
 //   - a "session window" gates all writes; outside it, posts get 403
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { isClean } from './moderation.mjs';
@@ -28,14 +29,76 @@ const MILESTONE_IDS = new Set([
   'wooden_pickaxe', 'stone_pickaxe', 'furnace', 'iron_ingot',
   'iron_pickaxe', 'diamond',
 ]);
-const DIAMOND_RE = /^diamond_\d+$/;
+const DIAMOND_RE = /^diamond_([1-9]\d{0,2})$/;
+
+// These ceilings are deliberately above the documented 100-participant
+// event, while making the maximum retained board and snapshot size finite.
+// All attacker-controlled strings are rejected before a Map/array allocation.
+export const BOARD_LIMITS = Object.freeze({
+  participants: 200,
+  achievementsPerParticipant: 256,
+  runsPerParticipant: 32,
+  narrations: 500,
+  participantChars: 64,
+  runIdChars: 64,
+  narrationTextChars: 500,
+  snapshotBytes: 8 * 1024 * 1024,
+});
+
+const MAX_PARTICIPANT_BYTES = 256;
+const MAX_RUN_ID_BYTES = 256;
+const MAX_NARRATION_TEXT_BYTES = 2_000;
+const MAX_DIAMOND_NUMBER = 999;
+const MAX_SESSION_SECONDS = 86_400;
+const NARRATION_KINDS = new Set(['chat', 'thought']);
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isBoundedString(value, maxChars, maxBytes) {
+  return typeof value === 'string'
+    && value.length > 0
+    && [...value].length <= maxChars
+    && Buffer.byteLength(value, 'utf8') <= maxBytes;
+}
+
+function isParticipantName(value) {
+  return isBoundedString(
+    value,
+    BOARD_LIMITS.participantChars,
+    MAX_PARTICIPANT_BYTES,
+  );
+}
+
+function isRunId(value) {
+  return isBoundedString(value, BOARD_LIMITS.runIdChars, MAX_RUN_ID_BYTES);
+}
+
+function isTimestamp(value) {
+  return typeof value === 'string'
+    && value.length <= 40
+    && Number.isFinite(Date.parse(value));
+}
+
+function isFiniteNumber(value, max) {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && value >= 0
+    && value <= max;
+}
+
+function snapshotError(message) {
+  throw new Error(`invalid board snapshot: ${message}`);
+}
 
 // 5 min + 5s grace; bot.js stamps run_elapsed_ms on every achievement.
 export const MAX_RUN_MS = 305_000;
 
 function pointsFor(id) {
-  if (TASK_POINTS[id] !== undefined) return TASK_POINTS[id];
-  if (DIAMOND_RE.test(id)) return 0;
+  if (Object.hasOwn(TASK_POINTS, id)) return TASK_POINTS[id];
+  const diamond = DIAMOND_RE.exec(id);
+  if (diamond && Number(diamond[1]) <= MAX_DIAMOND_NUMBER) return 0;
   return undefined; // unknown → rejected
 }
 
@@ -46,6 +109,7 @@ export class Board {
     this.narrations = [];          // {participant, name, kind, text, ts}
     this.session = null;           // {opened_at, closed_at, duration_seconds}
     this._saveTimer = null;
+    this._savePromise = Promise.resolve();
     this._load();
   }
 
@@ -53,47 +117,58 @@ export class Board {
   _load() {
     if (!this.snapshotPath) return;
     try {
-      const s = JSON.parse(readFileSync(this.snapshotPath, 'utf8'));
-      for (const p of s.participants || []) {
-        // Old snapshots stored completed_tasks as an array (Set);
-        // current format is an object (id → ISO ts).
-        const ct = Array.isArray(p.completed_tasks)
-          ? new Map(p.completed_tasks.map((id) => [id, null]))
-          : new Map(Object.entries(p.completed_tasks || {}));
-        this.participants.set(p.name, {
-          ...p,
-          completed_tasks: ct,
-          runs: new Map(Object.entries(p.runs || {})),
-        });
+      if (statSync(this.snapshotPath).size > BOARD_LIMITS.snapshotBytes) {
+        snapshotError(`file exceeds ${BOARD_LIMITS.snapshotBytes} bytes`);
       }
-      this.narrations = s.narrations || [];
-      this.session = s.session || null;
+      const state = this._decodeSnapshot(JSON.parse(readFileSync(this.snapshotPath, 'utf8')));
+      this.participants = state.participants;
+      this.narrations = state.narrations;
+      this.session = state.session;
       console.log(`[board] restored ${this.participants.size} participants from ${this.snapshotPath}`);
-    } catch { /* no snapshot yet */ }
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.log('[board] snapshot restore failed:', e.message);
+    }
   }
 
   save() {
     if (!this.snapshotPath || this._saveTimer) return;
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null;
-      this.flush();
+      void this.flush();
     }, 500);
   }
 
-  // Synchronous write — used by save()'s debounce timer and by graceful
-  // shutdown (where waiting 500ms isn't an option).
+  // Queue atomic asynchronous writes so participant requests never block on
+  // disk I/O. The state itself is hard-bounded before this serialization.
   flush() {
-    if (!this.snapshotPath) return;
+    if (!this.snapshotPath) return this._savePromise;
     if (this._saveTimer) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
     }
+    let text;
     try {
-      mkdirSync(dirname(this.snapshotPath), { recursive: true });
-      writeFileSync(this.snapshotPath, JSON.stringify(this.toJSON()));
+      text = JSON.stringify(this.toJSON());
+      if (Buffer.byteLength(text, 'utf8') > BOARD_LIMITS.snapshotBytes) {
+        throw new Error(`snapshot exceeds ${BOARD_LIMITS.snapshotBytes} bytes`);
+      }
     } catch (e) {
-      console.log('[board] snapshot save failed:', e.message);
+      console.log('[board] snapshot serialization failed:', e.message);
+      return this._savePromise;
     }
+
+    const writeSnapshot = async () => {
+      const temporaryPath = `${this.snapshotPath}.tmp`;
+      try {
+        await mkdir(dirname(this.snapshotPath), { recursive: true });
+        await writeFile(temporaryPath, text);
+        await rename(temporaryPath, this.snapshotPath);
+      } catch (e) {
+        console.log('[board] snapshot save failed:', e.message);
+      }
+    };
+    this._savePromise = this._savePromise.then(writeSnapshot, writeSnapshot);
+    return this._savePromise;
   }
 
   toJSON() {
@@ -109,19 +184,138 @@ export class Board {
   }
 
   restore(json) {
-    this.participants = new Map();
-    this.narrations = [];
-    this.session = null;
-    for (const p of json.participants || []) {
-      this.participants.set(p.name, {
-        ...p,
-        completed_tasks: new Map(Object.entries(p.completed_tasks || {})),
-        runs: new Map(Object.entries(p.runs || {})),
-      });
-    }
-    this.narrations = json.narrations || [];
-    this.session = json.session || null;
+    const state = this._decodeSnapshot(json);
+    this.participants = state.participants;
+    this.narrations = state.narrations;
+    this.session = state.session;
     this.save();
+  }
+
+  _decodeSnapshot(json) {
+    if (!isPlainObject(json)) snapshotError('root must be an object');
+    const rawParticipants = json.participants ?? [];
+    const rawNarrations = json.narrations ?? [];
+    if (!Array.isArray(rawParticipants)
+        || rawParticipants.length > BOARD_LIMITS.participants) {
+      snapshotError(`participants must contain at most ${BOARD_LIMITS.participants} entries`);
+    }
+    if (!Array.isArray(rawNarrations)
+        || rawNarrations.length > BOARD_LIMITS.narrations) {
+      snapshotError(`narrations must contain at most ${BOARD_LIMITS.narrations} entries`);
+    }
+
+    const participants = new Map();
+    for (const raw of rawParticipants) {
+      if (!isPlainObject(raw) || !isParticipantName(raw.name) || raw.id !== raw.name) {
+        snapshotError('participant identity is invalid');
+      }
+      if (participants.has(raw.name)) snapshotError('participant names must be unique');
+
+      // Old snapshots stored completed_tasks as an array (Set); current
+      // snapshots store an object (id -> ISO timestamp).
+      const taskEntries = Array.isArray(raw.completed_tasks)
+        ? raw.completed_tasks.map((id) => [id, null])
+        : isPlainObject(raw.completed_tasks ?? {})
+          ? Object.entries(raw.completed_tasks ?? {})
+          : snapshotError('completed_tasks must be an object or legacy array');
+      if (taskEntries.length > BOARD_LIMITS.achievementsPerParticipant) {
+        snapshotError('participant achievement quota exceeded');
+      }
+      const completedTasks = new Map();
+      for (const [id, timestamp] of taskEntries) {
+        if (typeof id !== 'string' || pointsFor(id) === undefined
+            || (timestamp !== null && !isTimestamp(timestamp))) {
+          snapshotError('achievement entry is invalid');
+        }
+        completedTasks.set(id, timestamp);
+      }
+
+      if (!isPlainObject(raw.runs ?? {})) snapshotError('runs must be an object');
+      const runEntries = Object.entries(raw.runs ?? {});
+      if (runEntries.length > BOARD_LIMITS.runsPerParticipant) {
+        snapshotError('participant run quota exceeded');
+      }
+      const runs = new Map();
+      for (const [runId, run] of runEntries) {
+        if (!isRunId(runId) || !isPlainObject(run)
+            || !isFiniteNumber(run.tokens, 1_000_000_000)
+            || !isFiniteNumber(run.turns, 1_000_000)
+            || !isFiniteNumber(run.diamonds, 1_000_000)
+            || !isTimestamp(run.updated_at)) {
+          snapshotError('run entry is invalid');
+        }
+        runs.set(runId, {
+          tokens: run.tokens,
+          turns: run.turns,
+          diamonds: run.diamonds,
+          updated_at: run.updated_at,
+        });
+      }
+
+      const lastActivity = raw.last_activity ?? null;
+      if (lastActivity !== null && !isTimestamp(lastActivity)) {
+        snapshotError('last_activity is invalid');
+      }
+      const participant = {
+        id: raw.name,
+        name: raw.name,
+        completed_tasks: completedTasks,
+        runs,
+        last_activity: lastActivity,
+      };
+      if (raw.live_run !== undefined) {
+        if (!isPlainObject(raw.live_run)
+            || !isFiniteNumber(raw.live_run.at, Number.MAX_SAFE_INTEGER)
+            || !isFiniteNumber(raw.live_run.remaining_ms, MAX_RUN_MS)) {
+          snapshotError('live_run is invalid');
+        }
+        participant.live_run = {
+          at: raw.live_run.at,
+          remaining_ms: raw.live_run.remaining_ms,
+        };
+      }
+      participants.set(raw.name, participant);
+    }
+
+    const narrations = rawNarrations.map((raw) => {
+      if (!isPlainObject(raw)
+          || !isParticipantName(raw.participant)
+          || raw.name !== raw.participant
+          || !NARRATION_KINDS.has(raw.kind)
+          || !isBoundedString(
+            raw.text,
+            BOARD_LIMITS.narrationTextChars,
+            MAX_NARRATION_TEXT_BYTES,
+          )
+          || !isFiniteNumber(raw.ts, Number.MAX_SAFE_INTEGER)) {
+        snapshotError('narration entry is invalid');
+      }
+      return {
+        participant: raw.participant,
+        name: raw.name,
+        kind: raw.kind,
+        text: raw.text,
+        ts: raw.ts,
+      };
+    });
+
+    let session = null;
+    if (json.session !== undefined && json.session !== null) {
+      const raw = json.session;
+      if (!isPlainObject(raw)
+          || !isTimestamp(raw.opened_at)
+          || (raw.closed_at !== null && !isTimestamp(raw.closed_at))
+          || !isFiniteNumber(raw.duration_seconds, MAX_SESSION_SECONDS)
+          || raw.duration_seconds < 1) {
+        snapshotError('session is invalid');
+      }
+      session = {
+        opened_at: raw.opened_at,
+        closed_at: raw.closed_at,
+        duration_seconds: raw.duration_seconds,
+      };
+    }
+    return { participants, narrations, session };
   }
 
   // ── session window ────────────────────────────────────────────────
@@ -149,10 +343,13 @@ export class Board {
   }
 
   openSession(durationSeconds) {
+    const requested = Math.round(Number(durationSeconds));
     this.session = {
       opened_at: new Date().toISOString(),
       closed_at: null,
-      duration_seconds: Math.round(durationSeconds) || 1800,
+      duration_seconds: Number.isFinite(requested) && requested > 0
+        ? Math.min(requested, MAX_SESSION_SECONDS)
+        : 1800,
     };
     this.save();
     return this.session;
@@ -178,11 +375,11 @@ export class Board {
 
   // ── participants ──────────────────────────────────────────────────
   participant(rawName) {
-    // Cap the name (matches the relay's 64-char cap) so unbounded
-    // attacker-chosen names can't bloat memory/snapshots, and so the
-    // same long name maps to one record everywhere.
-    const name = String(rawName).slice(0, 64);
+    const name = rawName;
     if (!this.participants.has(name)) {
+      if (this.participants.size >= BOARD_LIMITS.participants) {
+        throw new Error('participant quota exceeded');
+      }
       this.participants.set(name, {
         id: name,
         name,
@@ -199,6 +396,9 @@ export class Board {
     if (!participant || !id) {
       return { status: 400, body: { error: 'participant and id required' } };
     }
+    if (!isParticipantName(participant) || typeof id !== 'string') {
+      return { status: 400, body: { error: 'participant must be a string of at most 64 characters' } };
+    }
     if (!isClean(participant)) {
       return { status: 422, body: { error: 'participant name rejected' } };
     }
@@ -207,7 +407,7 @@ export class Board {
     }
     // Hard 5-min run cap, enforced server-side. null/missing = old bot;
     // reject so participants must update.
-    if (typeof run_elapsed_ms !== 'number' || run_elapsed_ms > MAX_RUN_MS) {
+    if (!isFiniteNumber(run_elapsed_ms, MAX_RUN_MS)) {
       return {
         status: 403,
         body: { error: `run_elapsed_ms ${run_elapsed_ms} outside 0..${MAX_RUN_MS}` },
@@ -216,6 +416,14 @@ export class Board {
     const points = pointsFor(id);
     if (points === undefined) {
       return { status: 400, body: { error: `unknown achievement: ${id}` } };
+    }
+    const current = this.participants.get(participant);
+    if (!current && this.participants.size >= BOARD_LIMITS.participants) {
+      return { status: 429, body: { error: 'participant limit reached' } };
+    }
+    if (current && !current.completed_tasks.has(id)
+        && current.completed_tasks.size >= BOARD_LIMITS.achievementsPerParticipant) {
+      return { status: 429, body: { error: 'achievement limit reached for participant' } };
     }
     const p = this.participant(participant);
     p.completed_tasks.set(id, new Date().toISOString());
@@ -231,18 +439,37 @@ export class Board {
     if (!participant || tokens === undefined || turns === undefined) {
       return { status: 400, body: { error: 'participant, tokens, turns required' } };
     }
+    if (!isParticipantName(participant)) {
+      return { status: 400, body: { error: 'participant must be a string of at most 64 characters' } };
+    }
     if (!isClean(participant)) {
       return { status: 422, body: { error: 'participant name rejected' } };
     }
+    if (!isFiniteNumber(tokens, 1_000_000_000)
+        || !isFiniteNumber(turns, 1_000_000)
+        || !isFiniteNumber(diamonds, 1_000_000)) {
+      return { status: 400, body: { error: 'tokens, turns, and diamonds must be finite non-negative numbers' } };
+    }
     if (!this.sessionWindow().open) {
       return { status: 403, body: { error: 'session not open' } };
+    }
+    const rid = run_id || 'default';
+    if (!isRunId(rid)) {
+      return { status: 400, body: { error: 'run_id must be a string of at most 64 characters' } };
+    }
+    const current = this.participants.get(participant);
+    if (!current && this.participants.size >= BOARD_LIMITS.participants) {
+      return { status: 429, body: { error: 'participant limit reached' } };
+    }
+    if (current && !current.runs.has(rid)
+        && current.runs.size >= BOARD_LIMITS.runsPerParticipant) {
+      return { status: 429, body: { error: 'run limit reached for participant' } };
     }
     const p = this.participant(participant);
     // Mark live on /cost too — achievements only fire on diamond pickup,
     // so a participant who's running but hasn't found one yet would
     // otherwise show as idle on the cast view.
     p.last_activity = new Date().toISOString();
-    const rid = run_id || 'default';
     // diamonds is self-reported (participant owns the bot AND the harness).
     // Real integrity = top-3 verify.py replay. This monotonic clamp just
     // makes the trivial curl cheat show as a slow climb instead of a spike.
@@ -264,22 +491,34 @@ export class Board {
     if (!participant || !text) {
       return { status: 400, body: { error: 'participant and text required' } };
     }
+    if (!isParticipantName(participant)
+        || !isBoundedString(
+          text,
+          BOARD_LIMITS.narrationTextChars,
+          MAX_NARRATION_TEXT_BYTES,
+        )) {
+      return { status: 400, body: { error: 'participant or narration text is too large' } };
+    }
+    const narrationKind = kind || 'chat';
+    if (!NARRATION_KINDS.has(narrationKind)) {
+      return { status: 400, body: { error: 'kind must be "chat" or "thought"' } };
+    }
     if (!isClean(participant) || !isClean(text)) {
       return { status: 422, body: { error: 'content rejected' } };
     }
     // Note: deliberately does NOT create a participant record — chat alone
     // shouldn't add rows to the board (kept the ticker usable pre-window
     // without letting it pollute the standings).
-    const name = String(participant).slice(0, 64);
+    const name = participant;
     this.narrations.push({
       participant: name,
       name,
-      kind: kind || 'chat',
-      text: String(text).slice(0, 500),
+      kind: narrationKind,
+      text,
       ts: Date.now(),
     });
-    if (this.narrations.length > 500) {
-      this.narrations.splice(0, this.narrations.length - 500);
+    if (this.narrations.length > BOARD_LIMITS.narrations) {
+      this.narrations.splice(0, this.narrations.length - BOARD_LIMITS.narrations);
     }
     this.save();
     return { status: 200, body: { ok: true } };
@@ -302,8 +541,10 @@ export class Board {
       const pts = tasks.reduce((s, t) => s + (pointsFor(t) || 0), 0);
       // Best single run within the session window: max diamonds, then min tokens.
       let best = null;
+      let latest = null;
       for (const [rid, r] of p.runs) {
         if (!inWindow(r.updated_at)) continue;
+        if (!latest || r.updated_at > latest.updated_at) latest = { run_id: rid, ...r };
         if (!best
             || r.diamonds > best.diamonds
             || (r.diamonds === best.diamonds && r.tokens < best.tokens)) {
@@ -325,7 +566,7 @@ export class Board {
         turns: best?.turns ?? 0,
         diamonds_count: diamondsCount,
         best_run_id: best?.run_id ?? null,
-        runs: Object.fromEntries(p.runs),
+        latest_run: latest,
         runs_count: p.runs.size,
         run_remaining_s: (() => {
           if (!p.live_run) return null;
@@ -334,7 +575,6 @@ export class Board {
         })(),
         milestones: tasks.filter((t) => MILESTONE_IDS.has(t)).length,
         quests: tasks.filter((t) => !MILESTONE_IDS.has(t) && !DIAMOND_RE.test(t)).length,
-        completed_tasks: tasks,
         last_activity: p.last_activity,
       };
     }).sort((a, b) => {

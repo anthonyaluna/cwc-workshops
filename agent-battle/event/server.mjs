@@ -479,10 +479,10 @@ httpServer.listen(PORT, () => {
 // Graceful shutdown: flush the snapshot so a platform restart (deploy,
 // scale event, OOM) never loses more than the last 500ms of writes.
 for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => {
+  process.on(sig, async () => {
     console.log(`[event] ${sig} — flushing snapshot and exiting`);
-    try { board.flush(); } catch { /* best effort */ }
-    httpServer.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
+    try { await board.flush(); } catch { /* best effort */ }
+    httpServer.close(() => process.exit(0));
   });
 }
