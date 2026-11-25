@@ -109,7 +109,8 @@ export class Board {
     this.narrations = [];          // {participant, name, kind, text, ts}
     this.session = null;           // {opened_at, closed_at, duration_seconds}
     this._saveTimer = null;
-    this._savePromise = Promise.resolve();
+    this._savePromise = null;
+    this._saveRequested = false;
     this._load();
   }
 
@@ -132,43 +133,53 @@ export class Board {
 
   save() {
     if (!this.snapshotPath || this._saveTimer) return;
+    if (this._savePromise) {
+      this._saveRequested = true;
+      return;
+    }
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null;
       void this.flush();
     }, 500);
   }
 
-  // Queue atomic asynchronous writes so participant requests never block on
-  // disk I/O. The state itself is hard-bounded before this serialization.
   flush() {
-    if (!this.snapshotPath) return this._savePromise;
+    if (!this.snapshotPath) return Promise.resolve();
     if (this._saveTimer) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
     }
-    let text;
+    this._saveRequested = true;
+    this._savePromise ??= this._flushPending();
+    return this._savePromise;
+  }
+
+  async _flushPending() {
+    // Keep just a dirty flag while I/O is pending. Serialize the latest board
+    // after the preceding write finishes, including changes made during shutdown.
     try {
-      text = JSON.stringify(this.toJSON());
+      while (this._saveRequested) {
+        this._saveRequested = false;
+        await this._writeSnapshot();
+      }
+    } finally {
+      this._savePromise = null;
+    }
+  }
+
+  async _writeSnapshot() {
+    try {
+      const text = JSON.stringify(this.toJSON());
       if (Buffer.byteLength(text, 'utf8') > BOARD_LIMITS.snapshotBytes) {
         throw new Error(`snapshot exceeds ${BOARD_LIMITS.snapshotBytes} bytes`);
       }
-    } catch (e) {
-      console.log('[board] snapshot serialization failed:', e.message);
-      return this._savePromise;
-    }
-
-    const writeSnapshot = async () => {
       const temporaryPath = `${this.snapshotPath}.tmp`;
-      try {
-        await mkdir(dirname(this.snapshotPath), { recursive: true });
-        await writeFile(temporaryPath, text);
-        await rename(temporaryPath, this.snapshotPath);
-      } catch (e) {
-        console.log('[board] snapshot save failed:', e.message);
-      }
-    };
-    this._savePromise = this._savePromise.then(writeSnapshot, writeSnapshot);
-    return this._savePromise;
+      await mkdir(dirname(this.snapshotPath), { recursive: true });
+      await writeFile(temporaryPath, text);
+      await rename(temporaryPath, this.snapshotPath);
+    } catch (e) {
+      console.log('[board] snapshot save failed:', e.message);
+    }
   }
 
   toJSON() {

@@ -476,13 +476,26 @@ httpServer.listen(PORT, () => {
   }
 });
 
-// Graceful shutdown: flush the snapshot so a platform restart (deploy,
-// scale event, OOM) never loses more than the last 500ms of writes.
+// Stop accepting traffic before saving the final state. The connection drain
+// has a deadline; a slow snapshot write must still be allowed to finish.
+let shuttingDown = false;
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`[event] ${sig} — flushing snapshot and exiting`);
-    setTimeout(() => process.exit(0), 2000).unref();
-    try { await board.flush(); } catch { /* best effort */ }
-    httpServer.close(() => process.exit(0));
+    await new Promise(resolve => {
+      const timer = setTimeout(() => {
+        httpServer.closeAllConnections();
+        resolve();
+      }, 2000);
+      timer.unref();
+      httpServer.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    await board.flush();
+    process.exit(0);
   });
 }

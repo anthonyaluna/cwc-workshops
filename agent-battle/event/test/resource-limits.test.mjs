@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { Board, BOARD_LIMITS } from '../lib/board.mjs';
@@ -234,4 +237,46 @@ test('relay caps registrations and pending calls', async () => {
   relay._onClose(ws);
   await Promise.all(pending);
   assert.equal(relay.pending.size, 0);
+});
+
+test('concurrent flushes retain only the latest pending snapshot', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'workshop-board-'));
+  try {
+    const filename = join(directory, 'snapshot.json');
+    const board = new Board(filename);
+    const serialize = board.toJSON.bind(board);
+    let serializations = 0;
+    board.toJSON = () => { serializations += 1; return serialize(); };
+
+    const narrate = (text) => board.recordNarration({ participant: 'Example', kind: 'chat', text });
+    narrate('first');
+    const saving = board.flush();
+    narrate('second');
+    const second = board.flush();
+    narrate('third');
+    const final = board.flush();
+
+    await Promise.all([saving, second, final]);
+    assert.equal(serializations, 2);
+    assert.deepEqual(new Board(filename).getNarrations().map(row => row.text), ['first', 'second', 'third']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a serialization failure allows a later flush to persist changes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'workshop-board-'));
+  try {
+    const filename = join(directory, 'snapshot.json');
+    const board = new Board(filename);
+    const serialize = board.toJSON.bind(board);
+    board.toJSON = () => { throw new Error('simulated serialization error'); };
+    await board.flush();
+    board.toJSON = serialize;
+    board.recordNarration({ participant: 'Example', kind: 'chat', text: 'after retry' });
+    await board.flush();
+    assert.equal(new Board(filename).getNarrations()[0].text, 'after retry');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
